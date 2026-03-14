@@ -1,7 +1,8 @@
 use std::{
-    io::{Read, Write},
-    net::{TcpListener, UdpSocket},
-    process::{Command, Stdio},
+    fmt::format,
+    io::{BufRead, BufReader, Read, Write},
+    net::{TcpListener, TcpStream, UdpSocket},
+    process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     thread,
 };
@@ -11,12 +12,39 @@ use serde::{Deserialize, Serialize};
 
 type Clients = Arc<Mutex<Vec<std::net::TcpStream>>>;
 type Gamepads = Arc<Mutex<[evdev::uinput::VirtualDevice; 2]>>;
+type RetroArchHandle = Arc<Mutex<Option<Child>>>;
+
+const RETROARCH: &str = "/opt/retropie/emulators/retroarch/bin/retroarch";
+const CORE: &str = "/opt/retropie/libretrocores/lr-snes9x/snes9x_libretro.so";
 
 #[derive(Serialize, Deserialize, Debug)]
 struct ClientInputEvent {
     player_id: u8,
     key: String,
     down: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(tag = "cmd")]
+enum ControlCommand {
+    ListGames,
+    LaunchGame { path: String },
+    StopGame,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(tag = "type")]
+enum ControlResponse {
+    GameList { games: Vec<GameEntry> },
+    Launched { name: String },
+    Stopped,
+    Error { message: String },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct GameEntry {
+    name: String,
+    path: String,
 }
 
 fn create_gamepad_keys() -> AttributeSet<KeyCode> {
@@ -263,6 +291,164 @@ fn broadcast_to_clients(clients: Clients) {
     let _ = ffmpeg.kill();
 }
 
+fn launch_retroarch(path: &str) -> std::io::Result<Child> {
+    std::fs::write(
+        "/tmp/ra-override.cfg",
+        "video_driver = \"gl\"\n\
+         input_driver = \"udev\"\n\
+         audio_driver = \"alsa\"\n\
+         video_fullscreen = \"true\"\n\
+         video_fullscreen_x = \"1024\"\n\
+         video_fullscreen_y = \"768\"\n\
+         input_player1_joypad_index = \"0\"\n\
+         input_player2_joypad_index = \"1\"\n",
+    )?;
+
+    Command::new(RETROARCH)
+        .args([
+            "--appendconfig",
+            "/tmp/ra-override.cfg",
+            "--libretro",
+            CORE,
+            "--fullscreen",
+            path,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+}
+
+fn scan_roms() -> Vec<GameEntry> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/pi".to_string());
+    let rom_dirs = [format!("{}/RetroPie/roms/snes", home)];
+
+    let extensions = ["sfc", "smc", "zip", "7z"];
+    let mut games = Vec::new();
+
+    for dir in &rom_dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+
+            if extensions.contains(&ext.as_str()) {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+
+                games.push(GameEntry {
+                    name,
+                    path: path.to_string_lossy().to_string(),
+                });
+            }
+        }
+    }
+
+    games.sort_by(|a, b| a.name.cmp(&b.name));
+    println!("[host] found {} snes roms", games.len());
+    games
+}
+
+fn handle_control(mut stream: TcpStream, retroarch_handle: RetroArchHandle) {
+    let addr = stream.peer_addr().unwrap();
+    println!("[control] connection from {}", addr);
+
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let response = match serde_json::from_str::<ControlCommand>(trimmed) {
+            Ok(ControlCommand::ListGames) => {
+                let games = scan_roms();
+                ControlResponse::GameList { games }
+            }
+
+            Ok(ControlCommand::LaunchGame { path }) => {
+                let mut handle = retroarch_handle.lock().unwrap();
+                if let Some(ref mut child) = *handle {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+
+                drop(handle);
+                thread::sleep(std::time::Duration::from_millis(500));
+
+                match launch_retroarch(&path) {
+                    Ok(child) => {
+                        let name = std::path::Path::new(&path)
+                            .file_stem()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or(&path)
+                            .to_string();
+                        println!("[control] launching {}", name);
+                        *retroarch_handle.lock().unwrap() = Some(child);
+                        ControlResponse::Launched { name }
+                    }
+                    Err(e) => ControlResponse::Error {
+                        message: e.to_string(),
+                    },
+                }
+            }
+
+            Ok(ControlCommand::StopGame) => {
+                let mut handle = retroarch_handle.lock().unwrap();
+                if let Some(ref mut child) = *handle {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    *handle = None;
+                    println!("[control] stopped retroarch");
+                    ControlResponse::Stopped
+                } else {
+                    ControlResponse::Error {
+                        message: "No game running".to_string(),
+                    }
+                }
+            }
+
+            Err(e) => ControlResponse::Error {
+                message: format!("Bad Command: {}", e),
+            },
+        };
+
+        if let Ok(mut json) = serde_json::to_string(&response) {
+            json.push('\n');
+            let _ = stream.write_all(json.as_bytes());
+        }
+
+        println!("[control] {} disconnected", addr);
+    }
+}
+
+fn control_server(retroarch_handle: RetroArchHandle) {
+    let listener = TcpListener::bind("0.0.0.0:9002").expect("Cannot bind to 0.0.0.0:9002");
+    println!("[control] retroarch control server Listening on 9002...");
+
+    for stream in listener.incoming().flatten() {
+        let ra = Arc::clone(&retroarch_handle);
+        thread::spawn(move || handle_control(stream, ra));
+    }
+}
+
 fn accept_loop(clients: Clients) {
     let listener = TcpListener::bind("0.0.0.0:9000").expect("cannot bind TCP 0.0.0.0:9000");
     println!("[host] waiting for players on TCP :9000 .......");
@@ -295,9 +481,13 @@ fn main() {
     println!("[server] created virtual gamepads");
 
     let clients: Clients = Arc::new(Mutex::new(Vec::new()));
+    let retroarch_handle: RetroArchHandle = Arc::new(Mutex::new(None));
 
     let g = Arc::clone(&gamepads);
     thread::spawn(move || listen_input(g));
+
+    let ra = Arc::clone(&retroarch_handle);
+    thread::spawn(move || control_server(ra));
 
     // broadcast loop
     let c = Arc::clone(&clients);
