@@ -13,7 +13,7 @@ type Clients = Arc<Mutex<Vec<std::net::TcpStream>>>;
 type Gamepads = Arc<Mutex<[evdev::uinput::VirtualDevice; 2]>>;
 
 #[derive(Serialize, Deserialize, Debug)]
-struct InputEvent {
+struct ClientInputEvent {
     player_id: u8,
     key: String,
     down: bool,
@@ -169,8 +169,9 @@ fn sdl_name_to_key(name: &str) -> Option<KeyCode> {
 
 fn emit_key(device: &mut evdev::uinput::VirtualDevice, key: KeyCode, down: bool) {
     let value = if down { 1 } else { 0 };
-    // let key_ev = EvdevEvent::new(EventType::KEY, code, value)
-    // device.emit(events)
+    let key_ev = EvdevEvent::new(EventType::KEY.0, key.code(), value);
+    let syn_ev = EvdevEvent::new(EventType::SYNCHRONIZATION.0, 0, 0);
+    let _ = device.emit(&[key_ev, syn_ev]);
 }
 
 fn listen_input(gamepads: Gamepads) {
@@ -182,7 +183,7 @@ fn listen_input(gamepads: Gamepads) {
         let Ok((len, _)) = socket.recv_from(&mut buf) else {
             continue;
         };
-        let Ok(event) = serde_json::from_slice::<InputEvent>(&buf[..len]) else {
+        let Ok(event) = serde_json::from_slice::<ClientInputEvent>(&buf[..len]) else {
             continue;
         };
 
@@ -191,6 +192,12 @@ fn listen_input(gamepads: Gamepads) {
 
         if let Some(key) = sdl_name_to_key(&key_name) {
             let mut pads = gamepads.lock().unwrap();
+            emit_key(&mut pads[idx], key, event.down);
+        } else {
+            eprintln!(
+                "[host] Unknown key '{}' from player {}",
+                event.key, event.player_id
+            );
         }
     }
 }
