@@ -1,5 +1,4 @@
 use std::{
-    clone,
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream, UdpSocket},
     process::{Child, Command, Stdio},
@@ -322,7 +321,7 @@ fn launch_retroarch(path: &str) -> std::io::Result<Child> {
 
 fn scan_roms() -> Vec<GameEntry> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/pi".to_string());
-    let rom_dirs = [format!("{}/RetroPie/roms/snes", home)];
+    let rom_dirs = [format!("{}/RetroPie/roms/snes/", home)];
 
     let extensions = ["sfc", "smc", "zip", "7z"];
     let mut games = Vec::new();
@@ -338,6 +337,8 @@ fn scan_roms() -> Vec<GameEntry> {
                 .and_then(|e| e.to_str())
                 .unwrap_or("")
                 .to_lowercase();
+
+            println!("Found file: {:?} with extension {:?}", path, ext);
 
             if extensions.contains(&ext.as_str()) {
                 let name = path
