@@ -1,5 +1,5 @@
 use std::{
-    fmt::format,
+    clone,
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream, UdpSocket},
     process::{Child, Command, Stdio},
@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 type Clients = Arc<Mutex<Vec<std::net::TcpStream>>>;
 type Gamepads = Arc<Mutex<[evdev::uinput::VirtualDevice; 2]>>;
 type RetroArchHandle = Arc<Mutex<Option<Child>>>;
+type BroadcastingFlag = Arc<Mutex<bool>>;
 
 const RETROARCH: &str = "/opt/retropie/emulators/retroarch/bin/retroarch";
 const CORE: &str = "/opt/retropie/libretrocores/lr-snes9x/snes9x_libretro.so";
@@ -358,7 +359,12 @@ fn scan_roms() -> Vec<GameEntry> {
     games
 }
 
-fn handle_control(mut stream: TcpStream, retroarch_handle: RetroArchHandle) {
+fn handle_control(
+    mut stream: TcpStream,
+    retroarch_handle: RetroArchHandle,
+    clients_ref: Clients,
+    broadcasting: BroadcastingFlag,
+) {
     let addr = stream.peer_addr().unwrap();
     println!("[control] connection from {}", addr);
 
@@ -384,14 +390,25 @@ fn handle_control(mut stream: TcpStream, retroarch_handle: RetroArchHandle) {
             }
 
             Ok(ControlCommand::LaunchGame { path }) => {
-                let mut handle = retroarch_handle.lock().unwrap();
-                if let Some(ref mut child) = *handle {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                {
+                    let mut handle = retroarch_handle.lock().unwrap();
+                    if let Some(ref mut child) = *handle {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        *handle = None
+                    }
                 }
 
-                drop(handle);
                 thread::sleep(std::time::Duration::from_millis(500));
+
+                // let mut handle = retroarch_handle.lock().unwrap();
+                // if let Some(ref mut child) = *handle {
+                //     let _ = child.kill();
+                //     let _ = child.wait();
+                // }
+
+                // drop(handle);
+                // thread::sleep(std::time::Duration::from_millis(500));
 
                 match launch_retroarch(&path) {
                     Ok(child) => {
@@ -400,8 +417,30 @@ fn handle_control(mut stream: TcpStream, retroarch_handle: RetroArchHandle) {
                             .and_then(|n| n.to_str())
                             .unwrap_or(&path)
                             .to_string();
-                        println!("[control] launching {}", name);
+                        println!(
+                            "[control] launching {} - waiting for retroarch to init",
+                            name
+                        );
                         *retroarch_handle.lock().unwrap() = Some(child);
+
+                        thread::sleep(std::time::Duration::from_secs(2));
+
+                        let mut is_broadcasting = broadcasting.lock().unwrap();
+                        if !*is_broadcasting {
+                            *is_broadcasting = true;
+                            let c = Arc::clone(&clients_ref);
+                            let b = Arc::clone(&broadcasting);
+                            thread::spawn(move || {
+                                broadcast_to_clients(c);
+                                *b.lock().unwrap() = false;
+                            });
+                            println!("[control] Broadcaster started");
+                        } else {
+                            println!(
+                                "[control] Broadcaster already running — new game on same stream"
+                            );
+                        }
+
                         ControlResponse::Launched { name }
                     }
                     Err(e) => ControlResponse::Error {
@@ -439,13 +478,19 @@ fn handle_control(mut stream: TcpStream, retroarch_handle: RetroArchHandle) {
     }
 }
 
-fn control_server(retroarch_handle: RetroArchHandle) {
+fn control_server(
+    retroarch_handle: RetroArchHandle,
+    clients: Clients,
+    broadcasting: BroadcastingFlag,
+) {
     let listener = TcpListener::bind("0.0.0.0:9002").expect("Cannot bind to 0.0.0.0:9002");
     println!("[control] retroarch control server Listening on 9002...");
 
     for stream in listener.incoming().flatten() {
         let ra = Arc::clone(&retroarch_handle);
-        thread::spawn(move || handle_control(stream, ra));
+        let c = Arc::clone(&clients);
+        let b = Arc::clone(&broadcasting);
+        thread::spawn(move || handle_control(stream, ra, c, b));
     }
 }
 
@@ -482,16 +527,18 @@ fn main() {
 
     let clients: Clients = Arc::new(Mutex::new(Vec::new()));
     let retroarch_handle: RetroArchHandle = Arc::new(Mutex::new(None));
+    let broadcasting: BroadcastingFlag = Arc::new(Mutex::new(false));
 
     let g = Arc::clone(&gamepads);
     thread::spawn(move || listen_input(g));
 
     let ra = Arc::clone(&retroarch_handle);
-    thread::spawn(move || control_server(ra));
-
+    let b = Arc::clone(&broadcasting);
     // broadcast loop
     let c = Arc::clone(&clients);
-    thread::spawn(move || broadcast_to_clients(c));
+
+    thread::spawn(move || control_server(ra, c, b));
+    // thread::spawn(move || broadcast_to_clients(c));
 
     // thread::spawn(move)
     accept_loop(clients);
