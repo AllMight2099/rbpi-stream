@@ -6,7 +6,10 @@ use std::{
     thread,
 };
 
-use evdev::{AttributeSet, EventType, InputEvent as EvdevEvent, KeyCode, uinput::VirtualDevice};
+use evdev::{
+    AbsInfo, AbsoluteAxisCode, AttributeSet, EventType, InputEvent as EvdevEvent, KeyCode,
+    UinputAbsSetup, uinput::VirtualDevice,
+};
 use serde::{Deserialize, Serialize};
 
 type Clients = Arc<Mutex<Vec<std::net::TcpStream>>>;
@@ -84,6 +87,16 @@ fn create_gamepad_keys() -> AttributeSet<KeyCode> {
         KeyCode::KEY_F10,
         KeyCode::KEY_F11,
         KeyCode::KEY_F12,
+        KeyCode::BTN_SOUTH,
+        KeyCode::BTN_EAST,
+        KeyCode::BTN_NORTH,
+        KeyCode::BTN_WEST,
+        KeyCode::BTN_START,
+        KeyCode::BTN_SELECT,
+        KeyCode::BTN_DPAD_DOWN,
+        KeyCode::BTN_DPAD_LEFT,
+        KeyCode::BTN_DPAD_RIGHT,
+        KeyCode::BTN_DPAD_UP,
     ])
 }
 
@@ -93,6 +106,11 @@ fn build_virtual_gamepad(name: &str) -> evdev::uinput::VirtualDevice {
         .name(name)
         .with_keys(&create_gamepad_keys())
         .expect("Failed to register keys")
+        .with_absolute_axis(&UinputAbsSetup::new(
+            AbsoluteAxisCode::ABS_X,
+            AbsInfo::new(0, -32768, 32767, 16, 128, 0),
+        ))
+        .expect("Failed to setup axis")
         .build()
         .expect("failed to build virtual device")
 }
