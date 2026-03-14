@@ -72,14 +72,14 @@ fn start_video_recieve(tcp: TcpStream) -> mpsc::Receiver<Vec<u8>> {
     });
 
     let frame_size = (STREAM_WIDTH * STREAM_HEIGHT * 3 / 2) as usize;
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(1);
 
     thread::spawn(move || {
         let mut frame = vec![0u8; frame_size];
         loop {
             match ffmpeg_output.read_exact(&mut frame) {
                 Ok(()) => {
-                    let _ = tx.send(frame.clone());
+                    let _ = tx.try_send(frame.clone());
                 }
                 Err(_) => break,
             }
