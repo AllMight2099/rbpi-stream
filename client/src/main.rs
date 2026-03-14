@@ -27,6 +27,12 @@ fn start_video_recieve(tcp: TcpStream) -> mpsc::Receiver<Vec<u8>> {
         .args([
             "-loglevel",
             "error",
+            "-fflags",
+            "nobuffer",
+            "-flags",
+            "low_delay",
+            "-strict",
+            "experimental",
             "-f",
             "mpegts",
             "-i",
