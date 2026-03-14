@@ -1,8 +1,9 @@
 use std::{
-    io::Read,
-    net::UdpSocket,
+    io::{Read, Write},
+    net::{TcpListener, UdpSocket},
     process::{Command, Stdio},
     sync::{Arc, Mutex},
+    thread,
 };
 
 use evdev::{AttributeSet, EventType, InputEvent as EvdevEvent, KeyCode, uinput::VirtualDevice};
@@ -102,17 +103,8 @@ fn listen_input(gamepads: Gamepads) {
     }
 }
 
-fn main() {
-    let gamepads: Gamepads = Arc::new(Mutex::new([
-        build_virtual_gamepad("gamepad1"),
-        build_virtual_gamepad("gamepad2"),
-    ]));
-    println!("[server] created virtual gamepads");
-
-    let clients: Clients = Arc::new(Mutex::new(Vec::new()));
-
-    let g = Arc::clone(&gamepads);
-    // thread::spawn(move)
+fn broadcast_to_clients(clients: Clients) {
+    println!("[host] Starting kmsgrab (card1) + h264_v4l2m2m encoder...");
 
     let mut ffmpeg = Command::new("ffmpeg")
         .args([
@@ -149,15 +141,59 @@ fn main() {
     loop {
         match output.read(&mut buffer) {
             Ok(0) | Err(_) => {
-                println!("ffmpeg process closed");
+                println!("[host] ffmpeg process closed");
                 break;
             }
             Ok(n) => {
-                // Process the data in buffer[0..n]
-                println!("Read {} bytes from ffmpeg", n);
+                let mut clients = clients.lock().unwrap();
+                clients.retain_mut(|s| s.write_all(&buffer[..n]).is_ok());
             }
         }
     }
 
     let _ = ffmpeg.kill();
+}
+
+fn accept_loop(clients: Clients) {
+    let listener = TcpListener::bind("0.0.0.0:9000").expect("cannot bind TCP 0.0.0.0:9000");
+    println!("[host] waiting for players on TCP :9000 .......");
+
+    let mut next_id: u8 = 1;
+
+    for stream in listener.incoming().flatten() {
+        let mut s = stream;
+        let addr = s.peer_addr().unwrap();
+
+        if s.write_all(&[next_id]).is_err() {
+            eprintln!("[host] Failed to send player_id to {}", addr);
+            continue;
+        }
+
+        println!("[host] Player {} connected from {}", next_id, addr);
+        clients.lock().unwrap().push(s);
+
+        // Wrap back to 1 after player 2 — 3rd connection becomes player 1 again
+        // (useful if a player disconnects and reconnects)
+        next_id = if next_id >= 2 { 1 } else { next_id + 1 };
+    }
+}
+
+fn main() {
+    let gamepads: Gamepads = Arc::new(Mutex::new([
+        build_virtual_gamepad("gamepad1"),
+        build_virtual_gamepad("gamepad2"),
+    ]));
+    println!("[server] created virtual gamepads");
+
+    let clients: Clients = Arc::new(Mutex::new(Vec::new()));
+
+    let g = Arc::clone(&gamepads);
+    thread::spawn(move || listen_input(g));
+
+    // broadcast loop
+    let c = Arc::clone(&clients);
+    thread::spawn(move || broadcast_to_clients(c));
+
+    // thread::spawn(move)
+    accept_loop(clients);
 }
