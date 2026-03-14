@@ -10,10 +10,10 @@ use std::{
 use sdl2::{event::Event, keyboard::Keycode, pixels::PixelFormatEnum, rect::Rect};
 use serde::{Deserialize, Serialize};
 
-const STREAM_WIDTH: u32 = 1280;
-const STREAM_HEIGHT: u32 = 720;
-const WINDOW_WIDTH: u32 = 1280;
-const WINDOW_HEIGHT: u32 = 720;
+const STREAM_WIDTH: u32 = 1024;
+const STREAM_HEIGHT: u32 = 768;
+const WINDOW_WIDTH: u32 = 1024;
+const WINDOW_HEIGHT: u32 = 768;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct InputEvent {
@@ -99,8 +99,6 @@ fn main() {
         eprintln!("Usage: client <raspberr pi IP>");
         std::process::exit(1);
     });
-
-    print!("here");
 
     let mut tcp =
         TcpStream::connect(format!("{}:9000", rbpi_ip)).expect("Failed to connect to raspberry pi");
